@@ -7,7 +7,6 @@ import time
 from uuid import uuid4
 from datetime import date
 
-# If these imports fail on Render for any reason, the app should STILL start.
 ENGINE_OK = True
 try:
     from engine import (
@@ -15,7 +14,7 @@ try:
         rank_assignments_by_danger,
         hours_next_days,
         workload_text_bars,
-        gpa_impact_estimates,  # optional; if missing, engine_ok will flip false
+        gpa_impact_estimates,  # optional
     )
 except Exception as e:
     ENGINE_OK = False
@@ -25,7 +24,14 @@ BASE_DIR = os.path.dirname(__file__)
 DATA_FILE = os.path.join(BASE_DIR, "assignments.json")
 
 app = Flask(__name__)
-CORS(app)
+
+# ✅ IMPORTANT: allow Content-Type + Authorization for Expo (web + mobile)
+CORS(
+    app,
+    resources={r"/*": {"origins": "*"}},
+    allow_headers=["Content-Type", "Authorization"],
+    methods=["GET", "POST", "DELETE", "OPTIONS"],
+)
 
 # ----------------------------
 # Helpers (simple JSON storage)
@@ -47,22 +53,26 @@ def _require_token():
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         return None
-    return auth.replace("Bearer ", "").strip()
+    token = auth.replace("Bearer ", "").strip()
+
+    # ✅ prevent accidental "Bearer undefined" / "Bearer null"
+    if not token or token in ("undefined", "null"):
+        return None
+    return token
 
 # ----------------------------
 # Health + home (web page)
 # ----------------------------
 @app.get("/health")
 def health():
-    return {
+    return jsonify({
         "ok": True,
         "engine_ok": ENGINE_OK,
         "data_file_exists": os.path.exists(DATA_FILE),
-    }, 200
+    }), 200
 
 @app.get("/")
 def home():
-    # Always render something, even if engine or data fails.
     today = date.today()
 
     if not ENGINE_OK:
@@ -74,7 +84,6 @@ def home():
             200,
         )
 
-    # Load assignments (if missing, treat as empty)
     try:
         assignments = load_assignments(DATA_FILE) if os.path.exists(DATA_FILE) else []
     except Exception as e:
@@ -85,12 +94,11 @@ def home():
 
     danger_rows = rank_assignments_by_danger(assignments, today) if assignments else []
 
-    # Analytics (next 3 days) – keep safe if empty
     try:
-        bars = workload_text_bars(assignments, today, window_days=3) if assignments else []
+        # your engine uses days=window_days, not window_days=
+        bars = workload_text_bars(assignments, today, days=3) if assignments else []
         nxt = hours_next_days(assignments, today, 3) if assignments else {"days": []}
-        # nxt is expected to be a dict with "days": [...], where each has {"hours": ...} in your earlier usage
-        # but your engine returns {"days": [{"total_hours": ...}, ...]}
+
         total_next_3 = 0
         if isinstance(nxt, dict) and isinstance(nxt.get("days"), list):
             total_next_3 = round(sum(d.get("total_hours", 0) for d in nxt["days"]), 2)
@@ -112,29 +120,40 @@ def home():
     )
 
 # ----------------------------
+# Debug endpoint (so clicks are never "silent")
+# ----------------------------
+@app.post("/debug")
+def debug():
+    return jsonify({
+        "ok": True,
+        "headers": dict(request.headers),
+        "json": request.get_json(silent=True),
+        "raw": request.data.decode("utf-8", errors="ignore"),
+    }), 200
+
+# ----------------------------
 # API (Expo expects these)
 # ----------------------------
-
 @app.post("/register")
 def register():
     body = request.get_json(silent=True) or {}
-    username = body.get("username")
-    password = body.get("password")
+    username = (body.get("username") or "").strip()
+    password = (body.get("password") or "").strip()
+
     if not username or not password:
         return jsonify({"error": "username and password required"}), 400
 
-    # v1: demo token (no DB yet)
     return jsonify({"access_token": f"demo-{username}"}), 200
 
 @app.post("/login")
 def login():
     body = request.get_json(silent=True) or {}
-    username = body.get("username")
-    password = body.get("password")
+    username = (body.get("username") or "").strip()
+    password = (body.get("password") or "").strip()
+
     if not username or not password:
         return jsonify({"error": "username and password required"}), 400
 
-    # v1: demo token (no DB yet)
     return jsonify({"access_token": f"demo-{username}"}), 200
 
 @app.get("/assignments")
@@ -191,6 +210,5 @@ def delete_assignment(id):
     return "", 204
 
 if __name__ == "__main__":
-    # Local dev only. Render ignores this and uses gunicorn.
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=True)
