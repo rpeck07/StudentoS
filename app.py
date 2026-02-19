@@ -17,11 +17,14 @@ from datetime import date, timedelta
 ENGINE_OK = True
 try:
     from engine import (
+        Assignment,
+        parse_date,
         load_assignments,
         rank_assignments_by_danger,
         hours_next_days,
         workload_text_bars,
         gpa_impact_estimates,
+        dashboard_summary,
     )
 except Exception as e:
     ENGINE_OK = False
@@ -32,11 +35,6 @@ USERS_FILE = os.path.join(BASE_DIR, "users.json")
 
 app = Flask(__name__)
 
-# ----------------------------
-# JWT Config
-# ----------------------------
-# IMPORTANT: set a real secret in Render environment variables:
-# Key: JWT_SECRET_KEY   Value: some-long-random-string
 app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY", "dev-secret-change-me")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(days=30)
 
@@ -51,11 +49,10 @@ CORS(
 
 
 # ----------------------------
-# User storage helpers
+# Helpers
 # ----------------------------
 
 def _read_users() -> dict:
-    """Returns dict of {username: hashed_password}"""
     if not os.path.exists(USERS_FILE):
         return {}
     try:
@@ -70,12 +67,7 @@ def _write_users(users: dict) -> None:
         json.dump(users, f, indent=2)
 
 
-# ----------------------------
-# Assignment storage helpers
-# ----------------------------
-
 def _user_data_file(username: str) -> str:
-    """Per-user assignments file, keyed by username."""
     safe = username.replace("/", "_").replace("..", "").replace(" ", "_")
     return os.path.join(BASE_DIR, f"data_{safe}.json")
 
@@ -93,6 +85,24 @@ def _read_json_file(path: str):
 def _write_json_file(path: str, data):
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
+
+
+def _load_user_assignments(username: str):
+    """Load a user's assignments from JSON and convert to engine Assignment objects."""
+    raw = _read_json_file(_user_data_file(username))
+    assignments = []
+    for x in raw:
+        try:
+            assignments.append(Assignment(
+                name=str(x["name"]),
+                weight_percent=float(x["weightPercent"]),
+                due_date=parse_date(str(x["dueDate"])),
+                confidence=int(x["confidence"]),
+                estimated_hours=float(x["estHours"]),
+            ))
+        except Exception:
+            pass
+    return assignments
 
 
 # ----------------------------
@@ -114,7 +124,7 @@ def home():
     if not ENGINE_OK:
         return (
             f"<h1>StudentOS is running ✅</h1>"
-            f"<p>But engine import failed:</p>"
+            f"<p>Engine import failed:</p>"
             f"<pre>{ENGINE_IMPORT_ERROR}</pre>",
             200,
         )
@@ -147,7 +157,7 @@ def home():
 
 
 # ----------------------------
-# Auth — Register
+# Auth
 # ----------------------------
 
 @app.post("/register")
@@ -158,31 +168,22 @@ def register():
 
     if not username or not password:
         return jsonify({"error": "username and password required"}), 400
-
     if len(username) < 3:
         return jsonify({"error": "username must be at least 3 characters"}), 400
-
     if len(password) < 6:
         return jsonify({"error": "password must be at least 6 characters"}), 400
 
     users = _read_users()
-
     if username in users:
         return jsonify({"error": "username already taken"}), 409
 
-    # Hash the password with bcrypt
     hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
     users[username] = hashed.decode("utf-8")
     _write_users(users)
 
-    # Issue a real JWT
     access_token = create_access_token(identity=username)
     return jsonify({"access_token": access_token}), 200
 
-
-# ----------------------------
-# Auth — Login
-# ----------------------------
 
 @app.post("/login")
 def login():
@@ -194,17 +195,59 @@ def login():
         return jsonify({"error": "username and password required"}), 400
 
     users = _read_users()
-
     if username not in users:
         return jsonify({"error": "invalid username or password"}), 401
 
-    # Check password against stored hash
     stored_hash = users[username].encode("utf-8")
     if not bcrypt.checkpw(password.encode("utf-8"), stored_hash):
         return jsonify({"error": "invalid username or password"}), 401
 
     access_token = create_access_token(identity=username)
     return jsonify({"access_token": access_token}), 200
+
+
+# ----------------------------
+# Dashboard (NEW)
+# ----------------------------
+
+@app.get("/dashboard")
+@jwt_required()
+def get_dashboard():
+    if not ENGINE_OK:
+        return jsonify({"error": "engine not available"}), 500
+
+    username = get_jwt_identity()
+    today = date.today()
+
+    assignments = _load_user_assignments(username)
+
+    if not assignments:
+        return jsonify({
+            "has_assignments": False,
+            "top": [],
+            "headlines": [],
+            "stress_forecast": {
+                "high_risk_count": 0,
+                "message": "No assignments yet.",
+                "window_days": 5,
+                "high_risk_names": []
+            },
+            "gpa_impacts": [],
+            "workload_next_3_days": [],
+        }), 200
+
+    summary = dashboard_summary(assignments, today)
+    gpa = gpa_impact_estimates(assignments, current_grade=85.0)
+    workload = hours_next_days(assignments, today, window_days=3)
+
+    return jsonify({
+        "has_assignments": True,
+        "top": summary["top"],
+        "headlines": summary["headlines"],
+        "stress_forecast": summary["stress_forecast"],
+        "gpa_impacts": gpa,
+        "workload_next_3_days": workload,
+    }), 200
 
 
 # ----------------------------
@@ -262,10 +305,6 @@ def delete_assignment(id):
     _write_json_file(path, new_items)
     return "", 204
 
-
-# ----------------------------
-# Debug
-# ----------------------------
 
 @app.post("/debug")
 def debug():
